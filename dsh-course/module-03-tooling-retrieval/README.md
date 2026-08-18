@@ -1,56 +1,113 @@
 # Module 3: Tooling & The Retrieval Mechanism
 
-Welcome to Module 3! We now know DSH uses Node.js, TypeScript, and the Cordis Plugin architecture. But how does an AI Agent actually read a codebase with 70,000 files?
+Welcome to Module 3! We now know DSH uses Node.js, TypeScript, and the Cordis Plugin architecture. But how does an AI Agent actually read a massive, 70,000-file enterprise codebase?
 
 ---
 
-## 1. The Context Window Problem
+## 1. The Context Window Bottleneck
 
-### The Bottleneck
-Large Language Models (LLMs) like GPT-4 or DeepSeek have a "Context Window". This is the maximum amount of text they can "hold in their head" at one time. Even if a model has a 128,000 token context window, a 70,000 file codebase contains *millions* of tokens.
+### The Mathematical Problem
+Large Language Models (LLMs) like GPT-4 or Claude have a "Context Window" (e.g., 128,000 tokens).
+A typical enterprise codebase with 70,000 files contains *millions* of tokens.
 
-**You cannot just copy-paste the codebase into the prompt.**
+**You cannot simply copy-paste the codebase into the LLM prompt.** If you try, the LLM will either crash with a "Context Window Exceeded" error, or it will suffer from "Lost in the Middle" syndrome (forgetting things placed in the middle of a massive prompt).
 
 ### The Solution: Tool-Augmented Retrieval
-Instead of giving the LLM the files, we give the LLM **Tools** (like a steering wheel and pedals). The LLM is forced to *drive* through the codebase, finding exactly what it needs.
+Instead of feeding the LLM the files, DSH gives the LLM **Tools** (like a steering wheel and pedals). The LLM is forced to *drive* through the codebase, actively querying and finding exactly what it needs.
 
 ---
 
-## 2. The Toolbox: How does DSH search?
+## 2. The Search Engine: Ripgrep (`rg`)
 
-To search 70,000 files, you need speed. You cannot use pure JavaScript to search massive disks—it's too slow. DeepSeek Harness solves this by reaching outside of Node.js to use extremely optimized system binaries.
+To search 70,000 files in milliseconds, you cannot use pure JavaScript reading files one by one. DeepSeek Harness solves this by reaching outside of Node.js to use extremely optimized system binaries.
 
-### A. Ripgrep (`rg`) - The Engine of `grep`
-DeepSeek Harness uses a tool called `dsh-tool-fs-search`. Inside this plugin, it packages a binary called **Ripgrep**.
-*   **What is it?** Ripgrep is a line-oriented search tool written in Rust. It is famous for being the fastest text search tool in the world. It respects `.gitignore` files automatically.
-*   **How DSH uses it:** The AI doesn't know what Rust is. The AI just calls a tool named `grep` with a parameter `"find function login"`. DSH translates this into a system command (using a service called `ctx.subprocess`), executes the fast Rust binary, captures the output, and hands it back to the AI.
+DeepSeek Harness packages a binary called **Ripgrep** (`@vscode/ripgrep`) inside the `dsh-tool-fs-search` plugin.
 
-### B. Glob Patterns (`glob`)
-When you want to find files by name (e.g., "Find all `.ts` files in the `src` folder"), DSH uses `glob`.
-*   A glob pattern looks like this: `src/**/*.ts`.
-*   The LLM uses the `glob` tool. DSH runs Ripgrep under the hood with specific flags (`rg --files --glob`) to instantly list files.
+*   **What is it?** Ripgrep is a line-oriented search tool written in Rust. It is the fastest text search tool in the world. It automatically skips hidden files and files listed in `.gitignore`.
+*   **How DSH uses it:** The AI doesn't know what Rust or Ripgrep is. The AI just calls a Cordis Tool named `grep`.
 
-### C. LSP (Language Server Protocol)
-*(While not explicitly detailed in the basic search, LSP is the next evolution).*
+### Deep Dive: The Tool Schema
+When DSH registers the `grep` tool, it sends a JSON Schema to the LLM that looks like this:
+
+```json
+{
+  "name": "grep",
+  "description": "Search file contents by regex pattern.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pattern": { "type": "string", "description": "The ripgrep regex." },
+      "path": { "type": "string", "description": "Optional directory to search." }
+    },
+    "required": ["pattern"]
+  }
+}
+```
+
+When the LLM replies with `{"name": "grep", "arguments": {"pattern": "function login"}}`, DSH intercepts this.
+
+---
+
+## 3. Safe Execution (The `ctx.subprocess` Seam)
+
+You cannot blindly let an LLM run shell commands on your computer. What if it hallucinates or is maliciously prompted to execute `rm -rf /` (delete everything)?
+
+DSH uses an incredibly strict pipeline to protect the system. It uses a Cordis service called `ctx.subprocess`.
+
+**Crucial Security Design:**
+DSH deliberately does *not* give the LLM access to a real Bash shell (`/bin/sh`) for search. It uses `ctx.subprocess` to spawn the Ripgrep binary *directly*, explicitly injecting the arguments as an array.
+
+```typescript
+// SECURE: Spawning the binary directly with strict arguments.
+// The OS treats the pattern purely as text, NOT as a shell command.
+ctx.subprocess.spawn('rg', ['--json', '--files', pattern]);
+
+// VULNERABLE (What DSH DOES NOT DO):
+// If pattern was `"a" && rm -rf /`, the shell would execute the deletion!
+exec(`rg --json --files ${pattern}`);
+```
+Because there is no shell interpreter, shell injection attacks are mathematically impossible.
+
+---
+
+## 4. Output Bounding & The Spill Store
+
+What if Ripgrep finds 50,000 matches for the word "const"? If DSH returned all 50,000 matches to the LLM, the context window would instantly explode.
+
+DSH implements strict **Output Bounding**.
+If the configuration sets `grepMaxMatches: 250`:
+1. Ripgrep returns 1,000 matches.
+2. DSH takes the first 250 matches and formats them nicely for the LLM prompt.
+3. **The Spill Backend:** What happens to the other 750 matches? DSH saves the *complete* 1,000 matches into an artifact file on the hard drive (e.g., `/tmp/dsh-spill-123.txt`).
+4. DSH appends a note to the LLM's prompt: *"Showing 250 of 1000 matches. The complete result could not be saved inline. Read /tmp/dsh-spill-123.txt for the rest."*
+
+This allows the AI to decide if it wants to use a `read_file` tool to inspect the spill artifact!
+
+---
+
+## 5. The Next Evolution: LSP (Language Server Protocol)
+
+While Ripgrep is essentially "dumb" text searching (matching strings to strings), DSH is built to support Semantic searching using **LSP**.
+
 *   **What is it?** Created by Microsoft, LSP is the engine that powers VSCode's "Go to Definition" and "Find All References".
-*   **Why it matters:** Instead of "dumb" text searching, an AI can use LSP tools to say, "Find exactly where the function `calculateTax` is defined, ignoring comments." DSH's plugin architecture allows an LSP plugin to snap right onto the pegboard.
+*   **How it works:** Instead of searching for the word "tax", LSP builds an Abstract Syntax Tree (AST) of the code. It *understands* the code.
+*   **The Protocol:** The Agent sends a JSON-RPC request to an LSP Server:
+    ```json
+    {
+      "jsonrpc": "2.0",
+      "method": "textDocument/definition",
+      "params": {
+        "textDocument": { "uri": "file:///src/billing.ts" },
+        "position": { "line": 10, "character": 15 }
+      }
+    }
+    ```
+    The LSP Server responds with the exact file and line number where that function is defined.
+*   Because of Cordis, DSH can simply plug an "LSP Service" onto the pegboard. The AI is given a `go_to_definition` tool, allowing it to navigate 70,000 files semantically, exactly like a human software engineer using an IDE.
 
 ---
 
-## 3. The Execution Pipeline (The Guardrails)
-
-You cannot blindly let an LLM run shell commands on your computer. What if it accidentally hallucinates `rm -rf /` (delete everything)? DSH uses an incredibly strict pipeline to protect the system.
-
-Here is what happens when the LLM says: *"I want to run `grep` to find 'password'."*
-
-1.  **`tools/pre-execute` (The Guard):** The Cordis waterfall begins. A security plugin checks if the Agent is allowed to search files.
-2.  **`ctx.subprocess` (The Sandboxed Execution):** DSH deliberately does *not* give the LLM access to a real Bash shell. It uses `ctx.subprocess` to launch *only* the Ripgrep binary (`rg`), explicitly injecting the arguments. There is no shell interpreter, which means shell injection attacks (like `grep "a" && rm -rf /`) are mathematically impossible.
-3.  **Output Bounding (The Cap):** What if Ripgrep finds 500,000 matches? The AI's context window would explode! DSH strictly limits the output. It uses rules like `grepMaxMatches: 250`.
-4.  **The Spill Backend:** If there are 1,000 matches, DSH gives the AI the first 250, and saves the rest to a "Spill Artifact" on disk. It tells the AI: *"I truncated this. If you need more, look at the spill file."*
-
----
-
-## 4. Visualizing the Retrieval Flow
+## 6. Visualizing the Retrieval Flow
 
 ```text
 ======================================================================
@@ -59,19 +116,20 @@ Here is what happens when the LLM says: *"I want to run `grep` to find 'password
 
  [1. THE AI AGENT]
     |
-    | "I need to find 'login' in the code. I will call the 'grep' tool."
+    | "I need to find 'login'. I will call the 'grep' tool."
+    | -> {"name": "grep", "arguments": {"pattern": "login"}}
     v
  [2. CORDIS TOOL REGISTRY]
-    | Checks the schema. "Yes, 'grep' is a valid tool."
+    | Validates JSON schema.
     v
  [3. tools/pre-execute WATERFALL]
     | Security Plugin: "Agent has permission. APPROVED."
     v
  [4. dsh-tool-fs-search (The Plugin)]
-    | Formats the command safely: rg --json "login"
+    | Formats the array safely: ['rg', '--json', 'login']
     v
  [5. ctx.subprocess (The System Execution)]
-    |   <---- (Spawns actual Ripgrep binary written in Rust)
+    |   <---- (Spawns actual Ripgrep binary natively. NO SHELL INJECTION)
     v
  [6. THE 70,000 FILES ON DISK]
     |   ----> (Ripgrep searches millions of lines in milliseconds)
@@ -79,19 +137,19 @@ Here is what happens when the LLM says: *"I want to run `grep` to find 'password
  [7. OUTPUT BOUNDING]
     | Found 1,000 matches.
     | Truncating to 250 matches to protect the AI's Context Window.
-    | Saving 750 matches to a Spill File.
+    | ctx.spillStore -> Saves all 1,000 to /tmp/spill.txt
     v
  [8. THE RESULT]
-    | Returns structured JSON to the AI Agent.
+    | Returns 250 formatted matches + Spill notification to the AI.
 
 ```
 
 ## Summary
 How does DSH handle 70,000 files?
 1. It **never** loads them into the prompt.
-2. It gives the AI **Tools** (`grep`, `glob`, `read_file`).
-3. It relies on **Ultra-fast binaries** (like Ripgrep) under the hood.
-4. It strictly **Caps and Bounds** the output so the AI doesn't choke on too much information.
+2. It translates LLM Tool calls into ultra-fast binary executions (Ripgrep) or semantic queries (LSP).
+3. It uses array-based subprocess spawning to guarantee security against shell injections.
+4. It relies on a "Spill Store" to strictly cap token usage without hiding data from the AI.
 
 ---
 *Now that our AI can search 70,000 files, how does it keep track of its thoughts? How does it ask another AI for help? Proceed to the final chapter: [Module 4](../module-04-subagents/README.md).*
