@@ -36,5 +36,13 @@ We will use **DeepSeek Harness (dsh)** as our primary study material. It is an e
 *   **Subagents:** How multiple agents talk to each other without losing context.
 *   **The Final Polish:** How state is saved and restored.
 
+### [Module 5: The Lifecycle of a Query (From Input to UI)](./module-05-lifecycle/README.md)
+*   **The Journey Begins:** How user input wakes the Agent Loop.
+*   **Context Projection:** How the Session Log is transformed into an LLM-friendly array.
+*   **Prompt Assembly:** Injecting Tool Schemas and System Prompts dynamically.
+*   **The LLM Handshake:** Streaming the response, parsing Tool Calls vs. Text.
+*   **The UI Bridge:** How backend JSON transforms into beautiful Frontend "Cards" (Render Intents).
+*   **Building Your Own Harness:** A blueprint for replicating this flow.
+
 ---
 *Let's get started! Proceed to [Module 1](./module-01-foundations/README.md).*
